@@ -22,7 +22,8 @@
   (setv read-buf-size (do-mac (<< 1 16)))
 
   (defn __init__ [self [buf b""]]
-    (setv self.buf buf))
+    (setv self.buf buf
+          self.eof False))
 
   (defn pop [self n]
     (let [buf self.buf]
@@ -46,9 +47,15 @@
   (async-defn read [self [n 4096]]
     (when (> n self.read-buf-size)
       (raise (BufferOverflowError n self.read-buf-size)))
-    (if self.buf
-        (.pop self n)
-        (async-wait (.read-primitive self n))))
+    (cond self.buf
+          (.pop self n)
+          self.eof
+          b""
+          True
+          (let [buf (async-wait (.read-primitive self n))]
+            (unless buf
+              (setv self.eof True))
+            buf)))
 
   (async-defn read-all [self]
     (let [bufs (list)
@@ -90,7 +97,7 @@
       (.unpop self (get sp 1))
       (get sp 0)))
 
-  (async-defn peek [self n]
+  (async-defn peek [self [n 4096]]
     (let [buf (async-wait (.read self n))]
       (.unpop self buf)
       buf))

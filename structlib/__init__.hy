@@ -5,11 +5,22 @@
 (import
   structlib.stream *)
 
+(defn bytes-concat [g]
+  (.join b"" g))
+
 (defn int-pack [i ilen]
   (.to-bytes i ilen "big"))
 
 (defn int-unpack [b]
   (int.from-bytes b "big"))
+
+(defn varlen-pack [data ilen]
+  (+ (int-pack (len data) ilen) data))
+
+(async-defclass VarLenUnpacker []
+  (async-defn [staticmethod] unpack-from-stream [reader ilen]
+    (let [dlen (int-unpack (async-wait (.read-exactly reader ilen)))]
+      (async-wait (.read-exactly reader dlen)))))
 
 (defn bits-pack [offsets bits ilen]
   (-> (cfor sum
@@ -85,6 +96,16 @@
     (for [name self.struct-names]
       (.append names name))))
 
+(defclass _RepeatMixin [Field]
+  (defn __init__ [self #* args #** kwargs]
+    (.__init__ (super) #* args #** kwargs)
+    (setv self.repeat (get self.meta "repeat"))))
+
+(defclass _StopFormMixin [Field]
+  (defn __init__ [self #* args #** kwargs]
+    (.__init__ (super) #* args #** kwargs)
+    (setv self.stop-form (.get self.meta "stop-form" '(not (async-wait (.peek reader)))))))
+
 (defclass BytesField [_LenMixin Field]
   (setv field-type 'bytes)
 
@@ -109,12 +130,10 @@
   (setv field-type 'varlen)
 
   (defn pack-setv-form [self]
-    `(setv ~self.name-raw (let [data ~self.pack-form]
-                            (+ (int-pack (len data) ~self.len) data))))
+    `(setv ~self.name-raw (varlen-pack ~self.pack-form ~self.len)))
 
   (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (let [dlen (int-unpack (async-wait (.read-exactly reader ~self.len)))]
-                            (async-wait (.read-exactly reader dlen)))
+    `(setv ~self.name-raw (.unpack-from-stream (async-name VarLenUnpacker) reader ~self.len)
            ~self.name ~self.unpack-form)))
 
 (defclass LineField [_SepMixin Field]
@@ -134,18 +153,28 @@
     `(setv ~self.name-raw (.pack ~self.struct #* ~self.pack-form)))
 
   (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (async-wait (.unpack ~self.struct reader))
+    `(setv ~self.name-raw (async-wait (.unpack-from-stream ~self.struct reader))
            ~self.name ~self.unpack-form)))
 
-(defclass StructInField [_StructNamesMixin _StructMixin Field]
-  (setv field-type 'structin)
+(defclass StructSingleField [_StructMixin Field]
+  (setv field-type 'struct-single)
+
+  (defn pack-setv-form [self]
+    `(setv ~self.name-raw (.pack ~self.struct ~self.pack-form)))
+
+  (defn unpack-setv-form [self]
+    `(setv ~self.name-raw (get (async-wait (.unpack-from-stream ~self.struct reader)) 0)
+           ~self.name ~self.unpack-form)))
+
+(defclass StructInlineField [_StructNamesMixin _StructMixin Field]
+  (setv field-type 'struct-inline)
 
   (defn pack-setv-form [self]
     `(setv ~self.name #(~@self.struct-names)
            ~self.name-raw (.pack ~self.struct #* ~self.pack-form)))
 
   (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (async-wait (.unpack ~self.struct reader))
+    `(setv ~self.name-raw (async-wait (.unpack-from-stream ~self.struct reader))
            ~self.name ~self.unpack-form
            #(~@self.struct-names) ~self.name)))
 
@@ -175,22 +204,116 @@
            ~self.name ~self.unpack-form
            #(~@self.struct-names) ~self.name)))
 
+(defclass RepeatBytesField [_RepeatMixin _LenMixin Field]
+  (setv field-type 'repeat-bytes)
+
+  (defn pack-setv-form [self]
+    `(setv ~self.name-raw (bytes-concat ~self.pack-form)))
+
+  (defn unpack-setv-form [self]
+    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
+                                (async-wait (.read-exactly reader ~self.len)))
+           ~self.name ~self.unpack-form)))
+
+(defclass RepeatIntField [_RepeatMixin _LenMixin Field]
+  (setv field-type 'repeat-int)
+
+  (defn pack-setv-form [self]
+    `(setv ~self.name-raw (bytes-concat (gfor data ~self.pack-form (int-pack data ~self.len)))))
+
+  (defn unpack-setv-form [self]
+    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
+                                (int-unpack (async-wait (.read-exactly reader ~self.len))))
+           ~self.name ~self.unpack-form)))
+
+(defclass RepeatVarlenField [_RepeatMixin _LenMixin Field]
+  (setv field-type 'repeat-varlen)
+
+  (defn pack-setv-form [self]
+    `(setv ~self.name-raw (bytes-concat (gfor data ~self.pack-form (varlen-pack data ~self.len)))))
+
+  (defn unpack-setv-form [self]
+    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
+                                (async-wait (.unpack-from-stream (async-name VarLenUnpacker) reader ~self.len)))
+           ~self.name ~self.unpack-form)))
+
+(defclass RepeatLineField [_RepeatMixin _SepMixin Field]
+  (setv field-type 'repeat-line)
+
+  (defn pack-setv-form [self]
+    `(setv ~self.name-raw (bytes-concat (gfor data ~self.pack-form (+ (.encode data) ~self.sep)))))
+
+  (defn unpack-setv-form [self]
+    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
+                                (.decode (async-wait (.read-until reader :sep ~self.sep))))
+           ~self.name ~self.unpack-form)))
+
+(defclass RepeatStructField [_RepeatMixin _StructMixin Field]
+  (setv field-type 'repeat-struct)
+
+  (defn pack-setv-form [self]
+    `(setv ~self.name-raw (bytes-concat (gfor data ~self.pack-form (.pack ~self.struct #* data)))))
+
+  (defn unpack-setv-form [self]
+    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
+                                (async-wait (.unpack-from-stream ~self.struct reader)))
+           ~self.name ~self.unpack-form)))
+
+(defclass DryBytesField [_StopFormMixin _LenMixin Field]
+  (setv field-type 'dry-bytes)
+
+  (defn pack-setv-form [self]
+    `(setv ~self.name-raw (bytes-concat ~self.pack-form)))
+
+  (defn unpack-setv-form [self]
+    `(do
+       (setv ~self.name-raw [])
+       (while True
+         (let [it (async-wait (.read-exactly reader ~self.len))]
+           (.append ~self.name-raw it)
+           (when ~self.stop-form
+             (break))))
+       (setv ~self.name ~self.unpack-form))))
+
 (async-defclass Struct []
+  (setv struct-names None)
+
+  (defn [staticmethod] pack [#* args]
+    (raise NotImplementedError))
+
+  (async-defn [staticmethod] unpack-from-stream [reader]
+    (raise NotImplementedError))
+
+  (async-defn [classmethod] pack-dict [cls d]
+    (.pack cls #* (gfor name cls.struct-names (get d name))))
+
   (async-defn [classmethod] unpack [cls buf]
-    (async-wait (cls.unpack-from-stream ((async-name BIOStreamReader) buf)))))
+    (let [reader ((async-name BIOStreamReader) buf)
+          st (async-wait (cls.unpack-from-stream reader))]
+      (let [buf (async-wait (.peek reader))]
+        (when (async-wait (.peek reader))
+          (raise (IncompleteReadError 0 (len buf)))))
+      st))
+
+  (async-defn [classmethod] unpack-dict-from-stream [cls reader]
+    (dict (zip cls.struct-names (async-wait (.unpack-from-stream cls reader)))))
+
+  (async-defn [classmethod] unpack-dict [cls buf]
+    (dict (zip cls.struct-names (async-wait (.unpack cls buf))))))
 
 (defmacro defstruct [name fields]
   (let [fields (lfor field fields (#/ structlib.Field.from-model field))
         struct-names (let [names (list)] (for [field fields] (.struct-append-names field names)) names)
         pack-names (let [names (list)] (for [field fields] (.pack-append-names field names)) names)]
     `(async-defclass ~name [(async-name Struct)]
+       (setv struct-names #(~@(gfor name struct-names (hy.mangle (str name)))))
        (defn [staticmethod] pack [~@struct-names]
          ~@(gfor field fields (.pack-setv-form field))
-         (.join b"" #(~@pack-names)))
+         (bytes-concat #(~@pack-names)))
        (async-defn [staticmethod] unpack-from-stream [reader]
          ~@(gfor field fields (.unpack-setv-form field))
          #(~@struct-names)))))
 
 (export
-  :objects [int-pack int-unpack bits-pack bits-unpack Struct AsyncStruct]
+  :objects [bytes-concat int-pack int-unpack varlen-pack VarLenUnpacker bits-pack bits-unpack Struct AsyncStruct]
   :macros [defstruct])

@@ -1,12 +1,12 @@
 (require
   hyrule :readers * *
-  asyncrule :readers * *)
+  asyncrule *)
 
 (import
   structlib.stream *)
 
-(defn bytes-concat [g]
-  (.join b"" g))
+(defn bytes-concat [bs]
+  (.join b"" bs))
 
 (defn int-pack [i ilen]
   (.to-bytes i ilen "big"))
@@ -14,24 +14,42 @@
 (defn int-unpack [b]
   (int.from-bytes b "big"))
 
-(defn varlen-pack [data ilen]
-  (+ (int-pack (len data) ilen) data))
-
-(async-defclass VarLenUnpacker []
-  (async-defn [staticmethod] unpack-from-stream [reader ilen]
-    (let [dlen (int-unpack (async-wait (.read-exactly reader ilen)))]
-      (async-wait (.read-exactly reader dlen)))))
-
 (defn bits-pack [offsets bits ilen]
   (-> (cfor sum
-            #(bit offset) (zip bits offsets)
+            #(offset bit) (zip offsets bits)
             (<< bit offset))
       (int-pack ilen)))
 
 (defn bits-unpack [offsets masks b]
   (let [i (int-unpack b)]
-    (gfor #(offset mask) (zip offsets masks)
+    (lfor #(offset mask) (zip offsets masks)
           (& (>> i offset) mask))))
+
+(async-defclass Struct []
+  (setv names None)
+
+  (defn [staticmethod] pack [#* args]
+    (raise NotImplementedError))
+
+  (async-defn [staticmethod] unpack-from-stream [reader]
+    (raise NotImplementedError))
+
+  (async-defn [classmethod] pack-dict [cls d]
+    (.pack cls #* (gfor name cls.names (get d name))))
+
+  (async-defn [classmethod] unpack-dict-from-stream [cls reader]
+    (dict (zip cls.names (async-wait (.unpack-from-stream cls reader)))))
+
+  (async-defn [classmethod] unpack [cls buf]
+    (let [reader ((async-name BIOStreamReader) buf)
+          st (async-wait (cls.unpack-from-stream reader))]
+      (let [buf (async-wait (.peek reader))]
+        (when (async-wait (.peek reader))
+          (raise (IncompleteReadError 0 (len buf)))))
+      st))
+
+  (async-defn [classmethod] unpack-dict [cls buf]
+    (dict (zip cls.names (async-wait (.unpack cls buf))))))
 
 (defclass Field []
   (setv field-type-dict (dict)
@@ -49,271 +67,189 @@
                  (while model
                    (let [k (.popleft model)
                          v (.popleft model)]
-                     (setv (get meta k.name) v)))
+                     (setv (get meta (hy.mangle k.name)) v)))
                  meta)]
       ((get cls.field-type-dict type) :name name :meta meta)))
 
   (defn __init__ [self name meta]
-    (setv self.name name
-          self.name-raw (hy.models.Symbol (+ (str name) "-raw"))
-          self.meta meta
-          self.pack-form (.get self.meta "pack-form" self.name)
-          self.unpack-form (.get self.meta "unpack-form" self.name-raw)))
+    (setv self._name name self._meta meta))
 
-  (defn struct-append-names [self names]
-    (.append names self.name))
+  (defn __getattr__ [self name]
+    (.get self._meta name))
 
-  (defn pack-append-names [self names]
-    (.append names self.name-raw))
+  (defn [#/ functools.cached-property] name [self]
+    (ebranch (isinstance self._name it)
+             hy.models.Symbol self._name
+             hy.models.List (hy.models.Symbol
+                              (+ "group-" (.join "-" (map str self._name))))))
 
-  (defn pack-setv-form [self]
+  (defn [#/ functools.cached-property] name-bytes [self]
+    (hy.models.Symbol (+ (str self.name) "-bytes")))
+
+  (defn [property] names [self]
+    (ebranch (isinstance self._name it)
+             hy.models.Symbol [self._name]
+             hy.models.List (list self._name)))
+
+  (defn [property] from-field-form [self]
+    (cond self.from
+          `(let [it ~self.name] ~self.from)
+          self.from-each
+          `(lfor it ~self.name ~self.from-each)
+          True
+          self.name))
+
+  (defn [property] to-field-form [self]
+    (cond self.to
+          self.to
+          self.to-each
+          `(let [them it] (lfor it them ~self.to-each))
+          True
+          'it))
+
+  (defn [property] from-bytes-1-form [self]
     (raise NotImplementedError))
 
-  (defn unpack-setv-form [self]
-    (raise NotImplementedError)))
+  (defn [property] to-bytes-1-form [self]
+    (raise NotImplementedError))
 
-(defclass _LenMixin [Field]
-  (defn __init__ [self #* args #** kwargs]
-    (.__init__ (super) #* args #** kwargs)
-    (setv self.len (get self.meta "len"))))
+  (defn [property] from-bytes-form [self]
+    (cond self.repeat
+          `(lfor _ (range ~self.repeat) ~self.from-bytes-1-form)
+          self.repeat-until
+          `(let [them (list)]
+             (while True
+               (let [it ~self.from-bytes-1-form]
+                 (.append them it)
+                 (when ~self.repeat-until
+                   (break))))
+             them)
+          True
+          self.from-bytes-1-form))
 
-(defclass _SepMixin [Field]
-  (defn __init__ [self #* args #** kwargs]
-    (.__init__ (super) #* args #** kwargs)
-    (setv self.sep (get self.meta "sep"))))
+  (defn [property] to-bytes-form [self]
+    (if (or self.repeat self.repeat-until)
+        `(let [them it]
+           (bytes-concat (gfor it them ~self.to-bytes-1-form)))
+        self.to-bytes-1-form))
 
-(defclass _StructMixin [Field]
-  (defn __init__ [self #* args #** kwargs]
-    (.__init__ (super) #* args #** kwargs)
-    (setv self.struct (get self.meta "struct"))))
-
-(defclass _StructNamesMixin [Field]
-  (defn __init__ [self #* args #** kwargs]
-    (.__init__ (super) #* args #** kwargs)
-    (setv self.struct-names (get self.meta "struct-names")))
-
-  (defn struct-append-names [self names]
-    (for [name self.struct-names]
-      (.append names name))))
-
-(defclass _RepeatMixin [Field]
-  (defn __init__ [self #* args #** kwargs]
-    (.__init__ (super) #* args #** kwargs)
-    (setv self.repeat (get self.meta "repeat"))))
-
-(defclass _StopFormMixin [Field]
-  (defn __init__ [self #* args #** kwargs]
-    (.__init__ (super) #* args #** kwargs)
-    (setv self.stop-form (.get self.meta "stop-form" '(not (async-wait (.peek reader)))))))
-
-(defclass BytesField [_LenMixin Field]
-  (setv field-type 'bytes)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw ~self.pack-form))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (async-wait (.read-exactly reader ~self.len))
-           ~self.name ~self.unpack-form)))
-
-(defclass IntField [_LenMixin Field]
-  (setv field-type 'int)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (int-pack ~self.pack-form ~self.len)))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (int-unpack (async-wait (.read-exactly reader ~self.len)))
-           ~self.name ~self.unpack-form)))
-
-(defclass VarLenField [_LenMixin Field]
-  (setv field-type 'varlen)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (varlen-pack ~self.pack-form ~self.len)))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (.unpack-from-stream (async-name VarLenUnpacker) reader ~self.len)
-           ~self.name ~self.unpack-form)))
-
-(defclass LineField [_SepMixin Field]
-  (setv field-type 'line)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (+ (.encode ~self.pack-form) ~self.sep)))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (.decode (async-wait (.read-until reader :sep ~self.sep)))
-           ~self.name ~self.unpack-form)))
-
-(defclass StructField [_StructMixin Field]
-  (setv field-type 'struct)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (.pack ~self.struct #* ~self.pack-form)))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (async-wait (.unpack-from-stream ~self.struct reader))
-           ~self.name ~self.unpack-form)))
-
-(defclass StructSingleField [_StructMixin Field]
-  (setv field-type 'struct-single)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (.pack ~self.struct ~self.pack-form)))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (get (async-wait (.unpack-from-stream ~self.struct reader)) 0)
-           ~self.name ~self.unpack-form)))
-
-(defclass StructInlineField [_StructNamesMixin _StructMixin Field]
-  (setv field-type 'struct-inline)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name #(~@self.struct-names)
-           ~self.name-raw (.pack ~self.struct #* ~self.pack-form)))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (async-wait (.unpack-from-stream ~self.struct reader))
-           ~self.name ~self.unpack-form
-           #(~@self.struct-names) ~self.name)))
-
-(defclass BitsField [_StructNamesMixin Field]
-  (setv field-type 'bits)
-
-  (defn __init__ [self #* args #** kwargs]
-    (.__init__ (super) #* args #** kwargs)
-    (setv self.lens (list (map int (get self.meta "lens"))))
-    (setv s (sum self.lens)
-          #(d m) (divmod s 8))
-    (unless (= m 0)
-      (raise ValueError))
-    (setv self.len d)
-    (setv self.masks (lfor len self.lens (- (<< 1 len) 1)))
-    (setv self.offsets (list))
-    (for [len self.lens]
-      (-= s len)
-      (.append self.offsets s)))
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name #(~@self.struct-names)
-           ~self.name-raw (bits-pack #(~@self.offsets) ~self.pack-form ~self.len)))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (bits-unpack #(~@self.offsets) #(~@self.masks) (async-wait (.read-exactly reader ~self.len)))
-           ~self.name ~self.unpack-form
-           #(~@self.struct-names) ~self.name)))
-
-(defclass RepeatBytesField [_RepeatMixin _LenMixin Field]
-  (setv field-type 'repeat-bytes)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (bytes-concat ~self.pack-form)))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
-                                (async-wait (.read-exactly reader ~self.len)))
-           ~self.name ~self.unpack-form)))
-
-(defclass RepeatIntField [_RepeatMixin _LenMixin Field]
-  (setv field-type 'repeat-int)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (bytes-concat (gfor data ~self.pack-form (int-pack data ~self.len)))))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
-                                (int-unpack (async-wait (.read-exactly reader ~self.len))))
-           ~self.name ~self.unpack-form)))
-
-(defclass RepeatVarlenField [_RepeatMixin _LenMixin Field]
-  (setv field-type 'repeat-varlen)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (bytes-concat (gfor data ~self.pack-form (varlen-pack data ~self.len)))))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
-                                (async-wait (.unpack-from-stream (async-name VarLenUnpacker) reader ~self.len)))
-           ~self.name ~self.unpack-form)))
-
-(defclass RepeatLineField [_RepeatMixin _SepMixin Field]
-  (setv field-type 'repeat-line)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (bytes-concat (gfor data ~self.pack-form (+ (.encode data) ~self.sep)))))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
-                                (.decode (async-wait (.read-until reader :sep ~self.sep))))
-           ~self.name ~self.unpack-form)))
-
-(defclass RepeatStructField [_RepeatMixin _StructMixin Field]
-  (setv field-type 'repeat-struct)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (bytes-concat (gfor data ~self.pack-form (.pack ~self.struct #* data)))))
-
-  (defn unpack-setv-form [self]
-    `(setv ~self.name-raw (lfor _ (range ~self.repeat)
-                                (async-wait (.unpack-from-stream ~self.struct reader)))
-           ~self.name ~self.unpack-form)))
-
-(defclass DryBytesField [_StopFormMixin _LenMixin Field]
-  (setv field-type 'dry-bytes)
-
-  (defn pack-setv-form [self]
-    `(setv ~self.name-raw (bytes-concat ~self.pack-form)))
-
-  (defn unpack-setv-form [self]
+  (defn [property] pack-setv-form [self]
+    "
+(setv a-bytes (let [it FROM-FIELD-FORM] TO-BYTES-FORM))
+(setv group-b-c #(b c))
+(setv group-b-c-bytes (let [it FROM-FIELD-FORM] TO-BYTES-FORM))
+(bytes-concat #(a-bytes group-b-c-bytes ...))
+"
     `(do
-       (setv ~self.name-raw [])
-       (while True
-         (let [it (async-wait (.read-exactly reader ~self.len))]
-           (.append ~self.name-raw it)
-           (when ~self.stop-form
-             (break))))
-       (setv ~self.name ~self.unpack-form))))
+       ~@(when (isinstance self._name hy.models.List)
+           `((setv ~self.name #(~@self._name))))
+       (setv ~self.name-bytes (let [it ~self.from-field-form]
+                                ~self.to-bytes-form))))
 
-(async-defclass Struct []
-  (setv struct-names None)
-
-  (defn [staticmethod] pack [#* args]
-    (raise NotImplementedError))
-
-  (async-defn [staticmethod] unpack-from-stream [reader]
-    (raise NotImplementedError))
-
-  (async-defn [classmethod] pack-dict [cls d]
-    (.pack cls #* (gfor name cls.struct-names (get d name))))
-
-  (async-defn [classmethod] unpack [cls buf]
-    (let [reader ((async-name BIOStreamReader) buf)
-          st (async-wait (cls.unpack-from-stream reader))]
-      (let [buf (async-wait (.peek reader))]
-        (when (async-wait (.peek reader))
-          (raise (IncompleteReadError 0 (len buf)))))
-      st))
-
-  (async-defn [classmethod] unpack-dict-from-stream [cls reader]
-    (dict (zip cls.struct-names (async-wait (.unpack-from-stream cls reader)))))
-
-  (async-defn [classmethod] unpack-dict [cls buf]
-    (dict (zip cls.struct-names (async-wait (.unpack cls buf))))))
+  (defn [property] unpack-setv-form [self]
+    "
+(setv a (let [it FROM-BYTES-FORM] TO-FIELD-FORM))
+(setv group-b-c (let [it FROM-BYTES-FORM] TO-FIELD-FORM))
+(setv #(b c) group-b-c)
+#(a b c ...)
+"
+    `(do
+       (setv ~self.name (let [it ~self.from-bytes-form]
+                          ~self.to-field-form))
+       ~@(when (isinstance self._name hy.models.List)
+           `((setv #(~@self._name) ~self.name))))))
 
 (defmacro defstruct [name fields]
   (let [fields (lfor field fields (#/ structlib.Field.from-model field))
-        struct-names (let [names (list)] (for [field fields] (.struct-append-names field names)) names)
-        pack-names (let [names (list)] (for [field fields] (.pack-append-names field names)) names)]
+        names (#/ functools.reduce #/ operator.add (gfor field fields field.names))
+        names-bytes (lfor field fields field.name-bytes)]
     `(async-defclass ~name [(async-name Struct)]
-       (setv struct-names #(~@(gfor name struct-names (hy.mangle (str name)))))
-       (defn [staticmethod] pack [~@struct-names]
-         ~@(gfor field fields (.pack-setv-form field))
-         (bytes-concat #(~@pack-names)))
+       (setv names #(~@(gfor name names (hy.mangle (str name)))))
+       (defn [staticmethod] pack [~@names]
+         ~@(gfor field fields field.pack-setv-form)
+         (bytes-concat #(~@names-bytes)))
        (async-defn [staticmethod] unpack-from-stream [reader]
-         ~@(gfor field fields (.unpack-setv-form field))
-         #(~@struct-names)))))
+         ~@(gfor field fields field.unpack-setv-form)
+         #(~@names)))))
+
+(defclass BytesField [Field]
+  (setv field-type 'bytes)
+
+  (defn [property] from-bytes-1-form [self]
+    `(async-wait (.read-exactly reader ~self.len)))
+
+  (defn [property] to-bytes-1-form [self]
+    'it))
+
+(defclass IntField [Field]
+  (setv field-type 'int)
+
+  (defn [property] from-bytes-1-form [self]
+    `(int-unpack (async-wait (.read-exactly reader ~self.len))))
+
+  (defn [property] to-bytes-1-form [self]
+    `(int-pack it ~self.len)))
+
+(defclass VarLenField [Field]
+  (setv field-type 'varlen)
+
+  (defn [property] from-bytes-1-form [self]
+    `(let [_len (int-unpack (async-wait (.read-exactly reader ~self.len)))]
+       (async-wait (.read-exactly reader _len))))
+
+  (defn [property] to-bytes-1-form [self]
+    `(+ (int-pack (len it) ~self.len) it)))
+
+(defclass LineField [Field]
+  (setv field-type 'line)
+
+  (defn [property] from-bytes-1-form [self]
+    `(.decode (async-wait (.read-until reader :sep ~self.sep))))
+
+  (defn [property] to-bytes-1-form [self]
+    `(+ (.encode it) ~self.sep)))
+
+(defclass BitsField [Field]
+  (setv field-type 'bits)
+
+  (defn [property] _lens [self]
+    (map int self.lens))
+
+  (defn [property] sum [self]
+    (sum self._lens))
+
+  (defn [property] len [self]
+    (let [#(d m) (divmod self.sum 8)]
+      (unless (= m 0)
+        (raise ValueError))
+      d))
+
+  (defn [property] offsets [self]
+    (let [sum self.sum
+          offsets (list)]
+      (for [len self._lens]
+        (-= sum len)
+        (.append offsets sum))
+      offsets))
+
+  (defn [property] masks [self]
+    (lfor len self._lens (- (<< 1 len) 1)))
+
+  (defn [property] from-bytes-1-form [self]
+    `(bits-unpack #(~@self.offsets) #(~@self.masks) (async-wait (.read-exactly reader ~self.len))))
+
+  (defn [property] to-bytes-1-form [self]
+    `(bits-pack #(~@self.offsets) it ~self.len)))
+
+(defclass StructField [Field]
+  (setv field-type 'struct)
+
+  (defn [property] from-bytes-1-form [self]
+    `(async-wait (.unpack-from-stream ~self.struct reader)))
+
+  (defn [property] to-bytes-1-form [self]
+    `(.pack ~self.struct #* it)))
 
 (export
-  :objects [bytes-concat int-pack int-unpack varlen-pack VarLenUnpacker bits-pack bits-unpack Struct AsyncStruct]
+  :objects [bytes-concat int-pack int-unpack bits-pack bits-unpack Struct AsyncStruct Field]
   :macros [defstruct])

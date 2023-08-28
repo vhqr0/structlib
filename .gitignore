@@ -1,2 +1,7 @@
 __pycache__
-*.py
+
+/structlib/*.py
+/structlib.egg-info
+/build
+/dist
+/test.py

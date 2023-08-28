@@ -19,6 +19,12 @@
         :setv #(k v) (.split header ":" 1)
         (.strip k) (.strip v)))
 
+(defstruct HTTPFirstLine
+  [[line firstline
+    :sep b"\r\n"
+    :from (.join " " it)
+    :to (.split it)]])
+
 (defstruct HTTPHeaders
   [[line headers
     :sep b"\r\n"
@@ -27,20 +33,12 @@
     :to (http-unpack it)]])
 
 (defstruct HTTPReq
-  [[line [meth path ver]
-    :sep b"\r\n"
-    :from (.join " " it)
-    :to (.split it)]
-   [struct [headers]
-    :struct HTTPHeaders]])
+  [[struct [[meth path ver]] :struct (async-name HTTPFirstLine)]
+   [struct [headers] :struct (async-name HTTPHeaders)]])
 
 (defstruct HTTPResp
-  [[line [ver status reason]
-    :sep b"\r\n"
-    :from (.join " " it)
-    :to (.split it)]
-   [struct [headers]
-    :struct HTTPHeaders]])
+  [[struct [[ver status reason]] :struct (async-name HTTPFirstLine)]
+   [struct [headers] :struct (async-name HTTPHeaders)]])
 
 (defstruct IPv4Addr
   [[bytes addr
@@ -63,16 +61,14 @@
    [int ttl :len 1]
    [int proto :len 1]
    [int cksum :len 2]
-   [struct [src] :struct (async-name IPv4Addr)]
-   [struct [dst] :struct (async-name IPv4Addr)]])
+   [struct [[src] [dst]] :struct (async-name IPv4Addr) :repeat 2]])
 
 (defstruct IPv6
   [[bits [ver tc fl] :lens [4 8 20]]
    [int plen :len 2]
    [int nh :len 1]
    [int hlim :len 1]
-   [struct [src] :struct (async-name IPv6Addr)]
-   [struct [dst] :struct (async-name IPv6Addr)]])
+   [struct [[src] [dst]] :struct (async-name IPv6Addr) :repeat 2]])
 
 (defclass Socks5Atype [IntEnum]
   (setv DN 3 V4 1 V6 4))

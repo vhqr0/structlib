@@ -77,19 +77,25 @@
   (defn __getattr__ [self name]
     (.get self._meta name))
 
+  (defn [#/ functools.cached-property] names [self]
+    (ebranch (isinstance self._name it)
+             hy.models.Symbol [self._name]
+             hy.models.List (#/ hyrule.flatten self._name)))
+
   (defn [#/ functools.cached-property] name [self]
     (ebranch (isinstance self._name it)
              hy.models.Symbol self._name
              hy.models.List (hy.models.Symbol
-                              (+ "group-" (.join "-" (map str self._name))))))
+                              (+ "group-" (.join "-" (map str self.names))))))
 
   (defn [#/ functools.cached-property] name-bytes [self]
     (hy.models.Symbol (+ (str self.name) "-bytes")))
 
-  (defn [property] names [self]
-    (ebranch (isinstance self._name it)
-             hy.models.Symbol [self._name]
-             hy.models.List (list self._name)))
+  (defn [#/ functools.cached-property] group-struct [self]
+    (when (isinstance self._name hy.models.List)
+      (defn model-l2t [l]
+        (hy.models.Tuple (gfor m l (if (isinstance m hy.models.List) (model-l2t m) m))))
+      (model-l2t self._name)))
 
   (defn [property] from-field-form [self]
     (cond self.from
@@ -141,8 +147,8 @@
 (bytes-concat #(a-bytes group-b-c-bytes ...))
 "
     `(do
-       ~@(when (isinstance self._name hy.models.List)
-           `((setv ~self.name #(~@self._name))))
+       ~@(when self.group-struct
+           `((setv ~self.name ~self.group-struct)))
        (setv ~self.name-bytes (let [it ~self.from-field-form]
                                 ~self.to-bytes-form))))
 
@@ -156,8 +162,8 @@
     `(do
        (setv ~self.name (let [it ~self.from-bytes-form]
                           ~self.to-field-form))
-       ~@(when (isinstance self._name hy.models.List)
-           `((setv #(~@self._name) ~self.name))))))
+       ~@(when self.group-struct
+           `((setv ~self.group-struct ~self.name))))))
 
 (defmacro defstruct [name fields]
   (let [fields (lfor field fields (#/ structlib.Field.from-model field))

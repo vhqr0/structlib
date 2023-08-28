@@ -40,6 +40,19 @@
   [[struct [[ver status reason]] :struct (async-name HTTPFirstLine)]
    [struct [headers] :struct (async-name HTTPHeaders)]])
 
+(defstruct UDP
+  [[int [sport dport] :len 2 :repeat 2]
+   [int plen :len 2]
+   [int cksum :len 2]])
+
+(defstruct TCP
+  [[int [sport dport] :len 2 :repeat 2]
+   [int [seq ack] :len 4 :repeat 2]
+   [bits [hlen res U A P R S F] :lens [4 6 1 1 1 1 1 1]]
+   [int win :len 2]
+   [int cksum :len 2]
+   [int uptr :len 2]])
+
 (defstruct IPv4Addr
   [[bytes addr
     :len 4

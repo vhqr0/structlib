@@ -9,11 +9,11 @@
   socket
   enum [IntEnum])
 
-(defn http-pack [headers]
+(defn http-headers-pack [headers]
   (doto (lfor #(k v) (headers.items) (.format "{}: {}" k v))
         (.append "")))
 
-(defn http-unpack [headers]
+(defn http-headers-unpack [headers]
   (.pop headers)
   (dfor header headers
         :setv #(k v) (.split header ":" 1)
@@ -29,8 +29,8 @@
   [[line headers
     :sep b"\r\n"
     :repeat-until (not it)
-    :from (http-pack it)
-    :to (http-unpack it)]])
+    :from (http-headers-pack it)
+    :to (http-headers-unpack it)]])
 
 (defstruct HTTPReq
   [[struct [[meth path ver]] :struct (async-name HTTPFirstLine)]
@@ -100,3 +100,28 @@
                    Socks5Atype.V4 (async-name IPv4Addr)
                    Socks5Atype.V6 (async-name IPv6Addr))]
    [int port :len 2]])
+
+(defstruct Socks5AuthReq
+  [[int ver :len 1 :to-validate (= it 5)]
+   [varlen meths :len 1 :to-validate (in 0 it)]])
+
+(defstruct Socks5AuthRep
+  [[int ver :len 1 :to-validate (= it 5)]
+   [int meth :len 1 :to-validate (= it 0)]])
+
+(defstruct Socks5Req
+  [[int ver :len 1 :to-validate (= it 5)]
+   [int cmd :len 1 :to-validate (= it 1)]
+   [int rsv :len 1 :to-validate (= it 0)]
+   [struct [atype host port] :struct (async-name Socks5Addr)]])
+
+(defstruct Socks5Rep
+  [[int ver :len 1 :to-validate (= it 5)]
+   [int rep :len 1 :to-validate (= it 0)]
+   [int rsv :len 1 :to-validate (= it 0)]])
+
+(defstruct TrojanReq
+  [[line auth :sep b"\r\n"]
+   [int cmd :len 1 :to-validate (= it 1)]
+   [struct [atype host port] :struct (async-name Socks5Addr)]
+   [line empty :sep b"\r\n" :to-validate (not it)]])

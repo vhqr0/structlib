@@ -25,6 +25,8 @@
     (lfor #(offset mask) (zip offsets masks)
           (& (>> i offset) mask))))
 
+(defclass StructValidationError [Exception])
+
 (async-defclass Struct []
   (setv names None)
 
@@ -149,6 +151,10 @@
     `(do
        ~@(when self.group-struct
            `((setv ~self.name ~self.group-struct)))
+       ~@(when self.from-validate
+           `((let [it ~self.name]
+               (unless ~self.from-validate
+                 (raise StructValidationError)))))
        (setv ~self.name-bytes (let [it ~self.from-field-form]
                                 ~self.to-bytes-form))))
 
@@ -163,7 +169,11 @@
        (setv ~self.name (let [it ~self.from-bytes-form]
                           ~self.to-field-form))
        ~@(when self.group-struct
-           `((setv ~self.group-struct ~self.name))))))
+           `((setv ~self.group-struct ~self.name)))
+       ~@(when self.to-validate
+           `((let [it ~self.name]
+               (unless ~self.to-validate
+                 (raise StructValidationError))))))))
 
 (defmacro defstruct [name fields]
   (let [fields (lfor field fields (#/ structlib.Field.from-model field))
@@ -257,5 +267,6 @@
     `(.pack ~self.struct #* it)))
 
 (export
-  :objects [bytes-concat int-pack int-unpack bits-pack bits-unpack Struct AsyncStruct Field]
+  :objects [bytes-concat int-pack int-unpack bits-pack bits-unpack
+            StructValidationError Struct AsyncStruct Field]
   :macros [defstruct])

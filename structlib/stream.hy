@@ -22,39 +22,39 @@
   (setv read-buf-size (do-mac (<< 1 16)))
 
   (defn __init__ [self [buf b""]]
-    (setv self.buf buf
-          self.eof False))
+    (setv self.read-buf buf
+          self.read-eof False))
 
-  (defn pop [self n]
-    (let [buf self.buf]
+  (defn read-buf-pop [self n]
+    (let [buf self.read-buf]
       (cond (= n 0)
             b""
-            (< 0 n (len self.buf))
+            (< 0 n (len self.read-buf))
             (do
-              (setv self.buf (cut buf n None))
+              (setv self.read-buf (cut buf n None))
               (cut buf n))
             True
             (do
-              (setv self.buf b"")
+              (setv self.read-buf b"")
               buf))))
 
-  (defn unpop [self buf]
-    (setv self.buf (+ buf self.buf)))
+  (defn read-buf-unpop [self buf]
+    (setv self.read-buf (+ buf self.read-buf)))
 
-  (async-defn read-primitive [n]
+  (async-defn read1 [n]
     (raise NotImplementedError))
 
   (async-defn read [self [n 4096]]
     (when (> n self.read-buf-size)
       (raise (BufferOverflowError n self.read-buf-size)))
-    (cond self.buf
-          (.pop self n)
-          self.eof
+    (cond self.read-buf
+          (.read-buf-pop self n)
+          self.read-eof
           b""
           True
-          (let [buf (async-wait (.read-primitive self n))]
+          (let [buf (async-wait (.read1 self n))]
             (unless buf
-              (setv self.eof True))
+              (setv self.read-eof True))
             buf)))
 
   (async-defn read-all [self]
@@ -82,7 +82,7 @@
     (let [buf (async-wait (.read-atleast self n))]
       (if (> (len buf) n)
           (do
-            (.unpop self (cut buf n None))
+            (.read-buf-unpop self (cut buf n None))
             (cut buf n))
           buf)))
 
@@ -94,17 +94,17 @@
         (when (> (len buf) self.read-buf-size)
           (raise (BufferOverflowError (len buf) self.read-buf-size)))
         (setv sp (.split buf sep 1)))
-      (.unpop self (get sp 1))
+      (.read-buf-unpop self (get sp 1))
       (get sp 0)))
 
   (async-defn peek [self [n 4096]]
     (let [buf (async-wait (.read self n))]
-      (.unpop self buf)
+      (.read-buf-unpop self buf)
       buf))
 
   (async-defn peek-atleast [self n]
     (let [buf (async-wait (.read-atleast self n))]
-      (.unpop self buf)
+      (.read-buf-unpop self buf)
       buf)))
 
 (async-defclass BIOStreamReader [(async-name StreamReader)]
@@ -112,7 +112,7 @@
     (.__init__ (super) #** kwargs)
     (setv self.bio (BytesIO bio)))
 
-  (async-defn read-primitive [self n]
+  (async-defn read1 [self n]
     (.read self.bio n)))
 
 (export
